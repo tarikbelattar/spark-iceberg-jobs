@@ -3,7 +3,7 @@
 # Name: Tarik Bel Attar
 # Import necessary PySpark modules and Python standard libraries
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import expr, col, avg, desc, broadcast, countDistinct
+from pyspark.sql.functions import expr, col
 import logging
 import sys
 
@@ -12,7 +12,7 @@ import sys
 # ========================================
 
 # Create a logger object
-logger = logging.getLogger("AggregationJobLogger")
+logger = logging.getLogger("PySparkLogger")
 logger.setLevel(logging.INFO)  # Set the logging level to INFO
 
 # Create a console handler to output logs to stdout
@@ -27,12 +27,73 @@ console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 
 # ========================================
+# Define Helper Functions
+# ========================================
+
+def load_dataframe(spark, file_path, alias_name, df_description):
+    """
+    Loads a CSV file into a Spark DataFrame with error handling and logging.
+
+    Parameters:
+    - spark (SparkSession): The SparkSession object.
+    - file_path (str): The path to the CSV file.
+    - alias_name (str): The alias to assign to the DataFrame.
+    - df_description (str): A descriptive name for the DataFrame (used in logs).
+
+    Returns:
+    - DataFrame or None: Returns the loaded DataFrame if successful, else None.
+    """
+    try:
+        logger.info(f"Starting to load DataFrame: {df_description} from {file_path}")
+
+        # Read the CSV file into a DataFrame
+        df = (
+            spark.read
+            .option("header", "true")          # Indicates that the first line in the CSV file contains headers
+            .option("inferSchema", "true")     # Instructs Spark to automatically infer data types of columns
+            .csv(file_path)                     # Path to the CSV file
+            .alias(alias_name)                 # Assign an alias for easier reference in joins
+        )
+
+        # Log success and schema
+        logger.info(f"Successfully loaded DataFrame: {df_description}")
+        df.printSchema()
+
+        return df
+
+    except Exception as e:
+        logger.error(f"Error loading DataFrame: {df_description} from {file_path}")
+        logger.error(f"Exception: {e}")
+        return None
+
+def validate_dataframe(df, df_description):
+    """
+    Validates that the DataFrame is not None and contains data.
+
+    Parameters:
+    - df (DataFrame or None): The DataFrame to validate.
+    - df_description (str): A descriptive name for the DataFrame (used in logs).
+
+    Returns:
+    - bool: True if DataFrame is valid, False otherwise.
+    """
+    if df is None:
+        logger.error(f"DataFrame {df_description} is None. Skipping further processing.")
+        return False
+    elif df.rdd.isEmpty():
+        logger.warning(f"DataFrame {df_description} is empty.")
+        return False
+    else:
+        logger.info(f"DataFrame {df_description} is loaded and contains data.")
+        return True
+
+# ========================================
 # Initialize SparkSession
 # ========================================
 
-def initialize_spark(app_name="aggregation_spark_job"):
+def initialize_spark(app_name="homework_spark_fundamental"):
     """
-    Initializes and returns a SparkSession with specific configurations.
+    Initializes and returns a SparkSession.
 
     Parameters:
     - app_name (str): The name of the Spark application.
@@ -44,7 +105,6 @@ def initialize_spark(app_name="aggregation_spark_job"):
         logger.info("Initializing SparkSession.")
         spark = SparkSession.builder \
             .appName(app_name) \
-            .config("spark.sql.autoBroadcastJoinThreshold", "-1") \
             .getOrCreate()
         logger.info("SparkSession initialized successfully.")
         return spark
@@ -54,358 +114,234 @@ def initialize_spark(app_name="aggregation_spark_job"):
         sys.exit(1)  # Exit the script as SparkSession is essential
 
 # ========================================
-# Load Iceberg Tables
-# ========================================
-
-def load_iceberg_tables(spark):
-    """
-    Loads Iceberg tables into Spark DataFrames.
-
-    Parameters:
-    - spark (SparkSession): The active SparkSession.
-
-    Returns:
-    - dict: A dictionary containing loaded DataFrames.
-    """
-    try:
-        logger.info("Loading Iceberg tables into DataFrames.")
-
-        # Load Iceberg tables with aliases
-        match_details = spark.table("bootcamp.match_details").alias("md")
-        matches = spark.table("bootcamp.matches").alias("m")
-        medal_matches_players = spark.table("bootcamp.medal_matches_players").alias("mmp")
-        medals = spark.table("bootcamp.medals").alias("med")
-        maps = spark.table("bootcamp.maps").alias("map")
-
-        logger.info("Successfully loaded all Iceberg tables.")
-
-        return {
-            "match_details": match_details,
-            "matches": matches,
-            "medal_matches_players": medal_matches_players,
-            "medals": medals,
-            "maps": maps
-        }
-
-    except Exception as e:
-        logger.error("Error loading Iceberg tables.")
-        logger.error(f"Exception: {e}")
-        sys.exit(1)  # Exit the script as table loading failed
-
-# ========================================
-# Explicitly Broadcast 'medals' and 'maps'
-# ========================================
-
-def broadcast_tables(dataframes):
-    """
-    Explicitly broadcasts the 'medals' and 'maps' DataFrames.
-
-    Parameters:
-    - dataframes (dict): Dictionary containing the loaded DataFrames.
-
-    Returns:
-    - dict: Dictionary containing the broadcasted DataFrames.
-    """
-    try:
-        logger.info("Broadcasting 'medals' and 'maps' tables.")
-
-        # Explicitly broadcast 'medals' and 'maps'
-        medals_broadcast = broadcast(dataframes["medals"])
-        maps_broadcast = broadcast(dataframes["maps"])
-
-        logger.info("'medals' and 'maps' tables have been broadcasted successfully.")
-
-        return {
-            "medals_broadcast": medals_broadcast,
-            "maps_broadcast": maps_broadcast
-        }
-
-    except Exception as e:
-        logger.error("Error broadcasting tables.")
-        logger.error(f"Exception: {e}")
-        sys.exit(1)  # Exit the script as broadcasting failed
-
-# ========================================
-# Perform Joins with Corrected Column Naming
-# ========================================
-
-def perform_joins(dataframes, broadcasts):
-    """
-    Performs the required joins with specified configurations.
-
-    Parameters:
-    - dataframes (dict): Dictionary containing loaded DataFrames.
-    - broadcasts (dict): Dictionary containing broadcasted DataFrames.
-
-    Returns:
-    - DataFrame: The joined DataFrame with unique column names.
-    """
-    try:
-        logger.info("Starting join operations.")
-
-        # Step 1: Join 'match_details' (md) with 'matches' (m) on 'match_id'
-        joined_df = dataframes["match_details"].join(
-            dataframes["matches"],
-            on="match_id",
-            how="inner"
-        ).select(
-            "match_id",
-            "player_gamertag",       # From md
-            "player_total_kills",    # From md
-            "playlist_id",           # From m
-            "mapid"                  # From m
-        )
-        logger.info("Joined 'match_details' with 'matches' on 'match_id'.")
-
-        # Step 2: Join the above with 'medal_matches_players' (mmp) on 'match_id'
-        # Exclude 'player_gamertag' from mmp to avoid duplication
-        joined_df = joined_df.join(
-            dataframes["medal_matches_players"].select(
-                "match_id",
-                "medal_id",
-                "count"
-            ),
-            on="match_id",
-            how="inner"
-        ).select(
-            "match_id",
-            "player_gamertag",
-            "player_total_kills",
-            "playlist_id",
-            "mapid",
-            "medal_id",
-            "count"
-        )
-        logger.info("Joined with 'medal_matches_players' on 'match_id'.")
-
-        # Step 3: Join with 'medals' (med) on 'medal_id' using the broadcasted DataFrame
-        # Rename 'name' to 'medal_name' and 'count' to 'medal_count' to avoid ambiguity
-        joined_df = joined_df.join(
-            broadcasts["medals_broadcast"],
-            on="medal_id",
-            how="inner"
-        ).select(
-            "match_id",
-            "player_gamertag",
-            "player_total_kills",
-            "playlist_id",
-            "mapid",
-            "medal_id",
-            "count",
-            "name"  # From med
-        ).withColumnRenamed("name", "medal_name").withColumnRenamed("count", "medal_count")
-        logger.info("Joined with 'medals' on 'medal_id' and renamed columns to resolve ambiguity.")
-
-        # Step 4: Join with 'maps' (map) on 'mapid' using the broadcasted DataFrame
-        # Rename 'name' to 'map_name' to avoid ambiguity
-        joined_df = joined_df.join(
-            broadcasts["maps_broadcast"],
-            on="mapid",
-            how="inner"
-        ).select(
-            "match_id",
-            "player_gamertag",
-            "player_total_kills",
-            "playlist_id",
-            "mapid",
-            "medal_id",
-            "medal_count",
-            "medal_name",
-            "name"  # From map
-        ).withColumnRenamed("name", "map_name")
-        logger.info("Joined with 'maps' on 'mapid' and renamed columns to resolve ambiguity.")
-
-        logger.info("All join operations completed successfully with unique column names.")
-
-        return joined_df
-
-    except Exception as e:
-        logger.error("Error during join operations.")
-        logger.error(f"Exception: {e}")
-        sys.exit(1)  # Exit the script as joins failed
-
-# ========================================
-# Aggregate Data
-# ========================================
-
-def aggregate_data(joined_df):
-    """
-    Aggregates the joined DataFrame to answer specific analytical questions.
-
-    Parameters:
-    - joined_df (DataFrame): The joined DataFrame.
-
-    Returns:
-    - dict: A dictionary containing aggregated results.
-    """
-    try:
-        logger.info("Starting data aggregation.")
-
-        # 1. Which player averages the most kills per game?
-        kills_per_game = joined_df.groupBy("player_gamertag") \
-            .agg(avg("player_total_kills").alias("avg_kills_per_game")) \
-            .orderBy(desc("avg_kills_per_game"))
-
-        top_player_kills = kills_per_game.first()
-        if top_player_kills:
-            logger.info(f"Top Player (Most Kills per Game): {top_player_kills['player_gamertag']} with {top_player_kills['avg_kills_per_game']:.2f} kills/game.")
-        else:
-            logger.info("No data available for player kills per game.")
-
-        # 2. Which playlist gets played the most?
-        playlist_popularity = joined_df.groupBy("playlist_id") \
-            .agg(countDistinct("match_id").alias("play_count")) \
-            .orderBy(desc("play_count"))
-
-        top_playlist = playlist_popularity.first()
-        if top_playlist:
-            logger.info(f"Top Playlist (Most Played): {top_playlist['playlist_id']} with {top_playlist['play_count']} plays.")
-        else:
-            logger.info("No data available for playlist popularity.")
-
-        # 3. Which map gets played the most?
-        map_popularity = joined_df.groupBy("mapid") \
-            .agg(countDistinct("match_id").alias("map_count")) \
-            .orderBy(desc("map_count"))
-
-        top_map = map_popularity.first()
-        if top_map:
-            logger.info(f"Top Map (Most Played): {top_map['mapid']} with {top_map['map_count']} plays.")
-        else:
-            logger.info("No data available for map popularity.")
-
-        # 4. Which map do players get the most Killing Spree medals on?
-        # Assuming "Killing Spree" medals have the name "Killing Spree"
-        killing_spree_medals = joined_df.filter(col("medal_name") == "Killing Spree")
-        killing_spree_medals_distinct = killing_spree_medals.dropDuplicates(["match_id"])
-
-        killing_spree_map = killing_spree_medals_distinct.groupBy("mapid") \
-            .agg(expr("SUM(medal_count) as total_killing_spree_medals")) \
-            .orderBy(desc("total_killing_spree_medals"))
-
-        top_killing_spree_map = killing_spree_map.first()
-        if top_killing_spree_map:
-            logger.info(f"Top Killing Spree Map: {top_killing_spree_map['mapid']} with {top_killing_spree_map['total_killing_spree_medals']} medals.")
-        else:
-            logger.info("No data available for Killing Spree medals.")
-
-        # Collect all results
-        results = {
-            "top_player_kills": top_player_kills,
-            "top_playlist": top_playlist,
-            "top_map": top_map,
-            "top_killing_spree_map": top_killing_spree_map
-        }
-
-        return results
-
-    except Exception as e:
-        logger.error("Error during data aggregation.")
-        logger.error(f"Exception: {e}")
-        sys.exit(1)  # Exit the script as aggregation failed
-
-# ========================================
-# Experiment with sortWithinPartitions
-# ========================================
-
-def experiment_sort_within_partitions(joined_df):
-    """
-    Experiments with different sortWithinPartitions to analyze data size impacts.
-
-    Parameters:
-    - joined_df (DataFrame): The joined DataFrame.
-
-    Returns:
-    - None
-    """
-    try:
-        logger.info("Starting experiments with sortWithinPartitions.")
-
-        # Function to calculate total data size in bytes after sorting
-        def calculate_data_size(df_sorted):
-            return df_sorted.rdd.map(lambda row: len(str(row))).sum()
-
-        # Example 1: Sort by 'playlist_id'
-        sorted_by_playlist = joined_df.sortWithinPartitions("playlist_id")
-        size_by_playlist = calculate_data_size(sorted_by_playlist)
-        logger.info(f"Total data size after sorting within partitions by 'playlist_id': {size_by_playlist} bytes.")
-
-        # Example 2: Sort by 'mapid'
-        sorted_by_map = joined_df.sortWithinPartitions("mapid")
-        size_by_map = calculate_data_size(sorted_by_map)
-        logger.info(f"Total data size after sorting within partitions by 'mapid': {size_by_map} bytes.")
-
-        # Example 3: Sort by 'player_gamertag'
-        sorted_by_player = joined_df.sortWithinPartitions("player_gamertag")
-        size_by_player = calculate_data_size(sorted_by_player)
-        logger.info(f"Total data size after sorting within partitions by 'player_gamertag': {size_by_player} bytes.")
-
-        # Example 4: Sort by 'match_id'
-        sorted_by_match = joined_df.sortWithinPartitions("match_id")
-        size_by_match = calculate_data_size(sorted_by_match)
-        logger.info(f"Total data size after sorting within partitions by 'match_id': {size_by_match} bytes.")
-
-        # Summary of sizes
-        logger.info("Summary of sortWithinPartitions experiments:")
-        logger.info(f"Sort by 'playlist_id': {size_by_playlist} bytes")
-        logger.info(f"Sort by 'mapid': {size_by_map} bytes")
-        logger.info(f"Sort by 'player_gamertag': {size_by_player} bytes")
-        logger.info(f"Sort by 'match_id': {size_by_match} bytes")
-
-    except Exception as e:
-        logger.error("Error during sortWithinPartitions experiments.")
-        logger.error(f"Exception: {e}")
-        sys.exit(1)  # Exit the script as experiments failed
-
-# ========================================
 # Main Execution Flow
 # ========================================
 
 def main():
     """
-    Main function to execute the aggregation Spark job.
+    Main function to execute the data loading, table creation, and data insertion processes.
     """
     # Initialize SparkSession
     spark = initialize_spark()
 
-    # Load Iceberg tables
-    dataframes = load_iceberg_tables(spark)
+    # Define file paths and metadata
+    data_files = {
+        "match_details": {
+            "path": "/home/iceberg/data/match_details.csv",
+            "alias": "md",
+            "description": "Match Details"
+        },
+        "matches": {
+            "path": "/home/iceberg/data/matches.csv",
+            "alias": "m",
+            "description": "Matches"
+        },
+        "medals_matches_players": {
+            "path": "/home/iceberg/data/medals_matches_players.csv",
+            "alias": "mmp",
+            "description": "Medals Matches Players"
+        },
+        "medals": {
+            "path": "/home/iceberg/data/medals.csv",
+            "alias": "med",
+            "description": "Medals"
+        },
+        "maps": {
+            "path": "/home/iceberg/data/maps.csv",
+            "alias": "maps",
+            "description": "Maps"
+        }
+    }
 
-    # Broadcast 'medals' and 'maps' tables
-    broadcasts = broadcast_tables(dataframes)
+    # Load all DataFrames
+    dataframes = {}
+    for df_key, df_info in data_files.items():
+        df = load_dataframe(
+            spark,
+            file_path=df_info["path"],
+            alias_name=df_info["alias"],
+            df_description=df_info["description"]
+        )
+        dataframes[df_key] = df
 
-    # Perform joins with corrected column naming
-    joined_df = perform_joins(dataframes, broadcasts)
+    # Validate DataFrames
+    for df_key, df in dataframes.items():
+        validate_dataframe(df, data_files[df_key]["description"])
 
-    # Aggregate data to answer analytical questions
-    results = aggregate_data(joined_df)
+    # Proceed only if all required DataFrames are loaded successfully
+    required_dfs = ["match_details", "matches", "medals_matches_players", "medals", "maps"]
+    all_valid = all([validate_dataframe(dataframes[df], data_files[df]["description"]) for df in required_dfs])
 
-    # Display aggregated results
-    logger.info("Aggregated Results:")
-    if results["top_player_kills"]:
-        logger.info(f"Top Player (Most Kills per Game): {results['top_player_kills']['player_gamertag']} with {results['top_player_kills']['avg_kills_per_game']:.2f} kills/game.")
-    else:
-        logger.info("No data available for Top Player.")
+    if not all_valid:
+        logger.error("One or more required DataFrames are missing or empty. Exiting the script.")
+        sys.exit(1)  # Exit the script as essential DataFrames are missing
 
-    if results["top_playlist"]:
-        logger.info(f"Top Playlist (Most Played): {results['top_playlist']['playlist_id']} with {results['top_playlist']['play_count']} plays.")
-    else:
-        logger.info("No data available for Top Playlist.")
+    # ========================================
+    # Create Iceberg Tables
+    # ========================================
 
-    if results["top_map"]:
-        logger.info(f"Top Map (Most Played): {results['top_map']['mapid']} with {results['top_map']['map_count']} plays.")
-    else:
-        logger.info("No data available for Top Map.")
+    # Define DDL statements for each Iceberg table
+    ddl_statements = {
+        "match_details": """
+            CREATE TABLE IF NOT EXISTS bootcamp.match_details(
+                match_id STRING,
+                player_gamertag STRING,
+                previous_spartan_rank INTEGER,
+                spartan_rank INTEGER,
+                previous_total_xp INTEGER,
+                total_xp INTEGER,
+                previous_csr_tier INTEGER,
+                previous_csr_designation INTEGER,
+                previous_csr INTEGER,
+                previous_csr_percent_to_next_tier INTEGER,
+                previous_csr_rank INTEGER,
+                current_csr_tier INTEGER,
+                current_csr_designation INTEGER,
+                current_csr INTEGER,
+                current_csr_percent_to_next_tier INTEGER,
+                current_csr_rank INTEGER,
+                player_rank_on_team INTEGER,
+                player_finished BOOLEAN,
+                player_average_life STRING,
+                player_total_kills INTEGER,
+                player_total_headshots INTEGER,
+                player_total_weapon_damage DOUBLE,
+                player_total_shots_landed INTEGER,
+                player_total_melee_kills INTEGER,
+                player_total_melee_damage DOUBLE,
+                player_total_assassinations INTEGER,
+                player_total_ground_pound_kills INTEGER,
+                player_total_shoulder_bash_kills INTEGER,
+                player_total_grenade_damage DOUBLE,
+                player_total_power_weapon_damage DOUBLE,
+                player_total_power_weapon_grabs INTEGER,
+                player_total_deaths INTEGER,
+                player_total_assists INTEGER,
+                player_total_grenade_kills INTEGER,
+                did_win INTEGER,
+                team_id INTEGER
+            ) USING iceberg
+            PARTITIONED BY (bucket(16, match_id))
+        """,
+        "matches": """
+            CREATE TABLE IF NOT EXISTS bootcamp.matches(
+                match_id STRING, 
+                mapid STRING, 
+                is_team_game BOOLEAN, 
+                playlist_id STRING, 
+                game_variant_id STRING, 
+                is_match_over BOOLEAN, 
+                completion_date TIMESTAMP, 
+                match_duration STRING, 
+                game_mode STRING, 
+                map_variant_id STRING 
+            ) USING iceberg
+            PARTITIONED BY (bucket(16, match_id))
+        """,
+        "medal_matches_players": """
+            CREATE TABLE IF NOT EXISTS bootcamp.medal_matches_players(
+                match_id STRING,
+                player_gamertag STRING,
+                medal_id LONG,
+                count INTEGER
+            ) USING iceberg
+            PARTITIONED BY (bucket(16, match_id))
+        """,
+        "maps": """
+            CREATE TABLE IF NOT EXISTS bootcamp.maps(
+                mapid STRING,
+                name STRING,
+                description STRING
+            ) USING iceberg
+            PARTITIONED BY (mapid)
+        """,
+        "medals": """
+            CREATE TABLE IF NOT EXISTS bootcamp.medals(
+                medal_id LONG,
+                sprite_uri STRING,
+                sprite_left INTEGER,
+                sprite_top INTEGER,
+                sprite_sheet_width INTEGER,
+                sprite_sheet_height INTEGER,
+                sprite_width INTEGER,
+                sprite_height INTEGER,
+                classification STRING,
+                description STRING,
+                name STRING,
+                difficulty INTEGER
+            ) USING iceberg
+            PARTITIONED BY (medal_id)
+        """
+    }
 
-    if results["top_killing_spree_map"]:
-        logger.info(f"Top Killing Spree Map: {results['top_killing_spree_map']['mapid']} with {results['top_killing_spree_map']['total_killing_spree_medals']} medals.")
-    else:
-        logger.info("No data available for Top Killing Spree Map.")
+    # Iterate over each DDL statement and execute it
+    for table_name, ddl in ddl_statements.items():
+        try:
+            logger.info(f"Creating Iceberg table: bootcamp.{table_name}")
+            spark.sql(ddl)
+            logger.info(f"Iceberg table bootcamp.{table_name} created successfully.")
+        except Exception as e:
+            logger.error(f"Error creating Iceberg table bootcamp.{table_name}")
+            logger.error(f"Exception: {e}")
+            sys.exit(1)  # Exit the script as table creation failed
 
-    # Experiment with sortWithinPartitions to analyze data size impacts
-    experiment_sort_within_partitions(joined_df)
+    # ========================================
+    # Insert Data into Iceberg Tables
+    # ========================================
 
+    # Insert data into bootcamp.match_details
+    try:
+        logger.info("Inserting data into Iceberg table: bootcamp.match_details")
+        dataframes["match_details"].write.mode("overwrite").saveAsTable("bootcamp.match_details")
+        logger.info("Data inserted successfully into bootcamp.match_details")
+    except Exception as e:
+        logger.error("Error inserting data into bootcamp.match_details")
+        logger.error(f"Exception: {e}")
+        sys.exit(1)  # Exit the script as data insertion failed
+
+    # Insert data into bootcamp.matches
+    try:
+        logger.info("Inserting data into Iceberg table: bootcamp.matches")
+        dataframes["matches"].write.mode("overwrite").saveAsTable("bootcamp.matches")
+        logger.info("Data inserted successfully into bootcamp.matches")
+    except Exception as e:
+        logger.error("Error inserting data into bootcamp.matches")
+        logger.error(f"Exception: {e}")
+        sys.exit(1)  # Exit the script as data insertion failed
+
+    # Insert data into bootcamp.medal_matches_players
+    try:
+        logger.info("Inserting data into Iceberg table: bootcamp.medal_matches_players")
+        dataframes["medals_matches_players"].write.mode("overwrite").saveAsTable("bootcamp.medal_matches_players")
+        logger.info("Data inserted successfully into bootcamp.medal_matches_players")
+    except Exception as e:
+        logger.error("Error inserting data into bootcamp.medal_matches_players")
+        logger.error(f"Exception: {e}")
+        sys.exit(1)  # Exit the script as data insertion failed
+
+    # Insert data into bootcamp.maps
+    try:
+        logger.info("Inserting data into Iceberg table: bootcamp.maps")
+        dataframes["maps"].write.mode("overwrite").saveAsTable("bootcamp.maps")
+        logger.info("Data inserted successfully into bootcamp.maps")
+    except Exception as e:
+        logger.error("Error inserting data into bootcamp.maps")
+        logger.error(f"Exception: {e}")
+        sys.exit(1)  # Exit the script as data insertion failed
+
+    # Insert data into bootcamp.medals
+    try:
+        logger.info("Inserting data into Iceberg table: bootcamp.medals")
+        dataframes["medals"].write.mode("overwrite").saveAsTable("bootcamp.medals")
+        logger.info("Data inserted successfully into bootcamp.medals")
+    except Exception as e:
+        logger.error("Error inserting data into bootcamp.medals")
+        logger.error(f"Exception: {e}")
+        sys.exit(1)  # Exit the script as data insertion failed
+
+    # ========================================
     # Terminate SparkSession
+    # ========================================
     try:
         logger.info("Terminating SparkSession.")
         spark.stop()
